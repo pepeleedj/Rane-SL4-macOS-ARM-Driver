@@ -76,3 +76,10 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 * **Idea original, puente Serato (`SL4Api.framework`), utilidad `sl4panel` e instalador macOS Universal:** **pepelee (PPLEE)** — Instagram: [@pepeleedj](https://www.instagram.com/pepeleedj/)
 * **Licencia:** [GPL-3.0-or-later](LICENSE).
 * *Disclaimer:* Proyecto independiente no afiliado con Rane ni Serato.
+
+---
+
+### 🔗 Other Rane Series Drivers for Apple Silicon (M1 / M2 / M3 / M4)
+* 🎛️ **Rane SL 2:** [pepeleedj/Rane-SL2-Macos-ARM-Driver](https://github.com/pepeleedj/Rane-SL2-Macos-ARM-Driver)
+* 🎛️ **Rane SL 3:** [pepeleedj/Rane-SL3-Macos-ARM-Driver](https://github.com/pepeleedj/Rane-SL3-Macos-ARM-Driver)
+* 🎛️ **Rane SL 4:** [pepeleedj/Rane-SL4-macOS-ARM-Driver](https://github.com/pepeleedj/Rane-SL4-macOS-ARM-Driver)
