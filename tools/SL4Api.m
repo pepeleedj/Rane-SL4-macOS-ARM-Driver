@@ -289,13 +289,16 @@ EXPORT int RH_send_hidimsg(void *h, const uint8_t *msg, int len) {
     return 0;
 }
 
-EXPORT int RH_send_note_on(void *h, uint8_t ch, uint8_t note, uint8_t vel) {
-    uint8_t m[3] = { (uint8_t)(0x90 | (ch & 0x0f)), note, vel };
+/* Rane's API takes (handle, note, velocity): the SL 4 Audio Control Panel calls
+   SL4_send_note_on(h, 0x5C..0x5F, 0) for thru on and SL4_send_note_off for off
+   (0x61 = phono/line with the deck in the velocity). */
+EXPORT int RH_send_note_on(void *h, uint8_t note, uint8_t vel) {
+    uint8_t m[3] = { 0x90, note, vel };
     return RH_send_hidimsg(h, m, 3);
 }
 
-EXPORT int RH_send_note_off(void *h, uint8_t ch, uint8_t note, uint8_t vel) {
-    uint8_t m[3] = { (uint8_t)(0x80 | (ch & 0x0f)), note, vel };
+EXPORT int RH_send_note_off(void *h, uint8_t note, uint8_t vel) {
+    uint8_t m[3] = { 0x80, note, vel };
     return RH_send_hidimsg(h, m, 3);
 }
 
@@ -367,8 +370,8 @@ EXPORT int   SL4_get_firmware_version(void *h, int *v) { return RH_get_firmware_
 EXPORT int   SL4_get_firmware_embedded_version(void *h, int *v) { return RH_get_firmware_embedded_version(h, v); }
 EXPORT int   SL4_get_all_controls(void *h) { return RH_get_all_controls(h); }
 EXPORT int   SL4_send_hidimsg(void *h, const uint8_t *msg, int len) { return RH_send_hidimsg(h, msg, len); }
-EXPORT int   SL4_send_note_on(void *h, uint8_t ch, uint8_t note, uint8_t vel) { return RH_send_note_on(h, ch, note, vel); }
-EXPORT int   SL4_send_note_off(void *h, uint8_t ch, uint8_t note, uint8_t vel) { return RH_send_note_off(h, ch, note, vel); }
+EXPORT int   SL4_send_note_on(void *h, uint8_t note, uint8_t vel) { return RH_send_note_on(h, note, vel); }
+EXPORT int   SL4_send_note_off(void *h, uint8_t note, uint8_t vel) { return RH_send_note_off(h, note, vel); }
 EXPORT int   SL4_send_sys_ex(void *h, const uint8_t *d, int len) { return RH_send_sys_ex(h, d, len); }
 EXPORT int   SL4_set_hidimsg_callback(void *h, void *cb) { return RH_set_hidimsg_callback(h, cb); }
 EXPORT int   SL4_send_bridge_packet(void *h, const uint8_t *d, int len) { return RH_send_bridge_packet(h, d, len); }

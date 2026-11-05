@@ -15,3 +15,5 @@ panel:
 
 clean:
 	rm -f SL4Device SL4Api sl4panel
+
+.PHONY: all plugin api panel clean

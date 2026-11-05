@@ -29,14 +29,17 @@
 #define IF_PLAY      1
 #define IF_CAP       2
 #define IF_HID       3
-#define EP_PLAY      0x02
-#define EP_CAP       0x86
+#define EP_PLAY      0x06    /* IF1 alt1: isochronous OUT, asynchronous, bInterval 1 */
+#define EP_CAP       0x82    /* IF2 alt1: isochronous IN, implicit feedback, bInterval 1 */
 #define EP_HID_OUT   0x01
 #define EP_HID_IN    0x81
 
 #define NCH          10
 #define FRAME_BYTES  40      /* 10 ch * 4 bytes (24-bit left-justified in 32-bit int) */
-#define PKT_MAX      720     /* 0x2D0 max bytes per microframe */
+#define PKT_MAX      280     /* wMaxPacketSize of EP 0x06/0x82: 7 frames * 40 bytes per microframe */
+#define PKT_BUF_MAX  720     /* max buffer stride per microframe */
+#define HEARTBEAT_MS 100
+#define IN_SAFETY_44 900     /* input safety offset in frames at 44.1 kHz (~20 ms) */
 #define CAP_PKTS     8       /* 1 ms per transfer */
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
@@ -78,7 +81,10 @@ static os_log_t g_log;
 static AudioServerPlugInHostRef g_host = NULL;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_hid_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hout_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_cap_pkt_max = PKT_MAX;
+static uint32_t g_play_pkt_max = PKT_MAX;
 
 static Float64  g_sr = 48000.0;
 static UInt32   g_io_clients = 0;
@@ -122,13 +128,17 @@ static _Atomic int g_play_inflight = 0;
 
 /* HID state */
 static NSMutableData *g_hbuf_in;
-static uint32_t g_seq = 1;
+static _Atomic uint32_t g_seq = 1;
 static dispatch_semaphore_t g_hid_sem;
 static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[64];
 static uint8_t  g_last_cmd_in[64];
 static SL4StatusPacket g_st;
+
+/* 0x37 heartbeat (8 random challenge bytes, the box answers with 8 derived bytes) */
+static dispatch_source_t g_hb_timer;
+static uint32_t g_hb_seq;
 
 /* Unsolicited HID packet ring buffer for SL4Api callbacks */
 #define UNSOL_Q_MAX 64
@@ -174,6 +184,8 @@ static void hb_read(void) {
                 memcpy(g_reply_buf, b, 64);
                 g_wait_cmd = 0;
                 dispatch_semaphore_signal(g_hid_sem);
+            } else if (b[0] == 0x37 && rseq == g_hb_seq) {
+                /* reply to our own heartbeat: not a notification for clients */
             } else {
                 /* Unsolicited notification from SL4 hardware */
                 if (b[0] == 0x40) {
@@ -218,7 +230,9 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     NSMutableData *d = [NSMutableData dataWithBytes:buf length:64];
     NSUInteger sent = 0;
     NSError *e = nil;
+    pthread_mutex_lock(&g_hout_mtx);
     [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
+    pthread_mutex_unlock(&g_hout_mtx);
 
     bool ok = true;
     if (g_wait_cmd != 0) {
@@ -281,7 +295,37 @@ static void set_usb_switches(bool usb_mode) {
     }
 }
 
-static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2) {
+/* Heartbeat. Like the SL 2 and SL 3, the SL 4 answers command 0x37 (8 challenge bytes -> 8
+   derived bytes) and keeps its decks on USB audio only while this traffic flows.
+   Runs on g_q every HEARTBEAT_MS while streaming. */
+static void hb_tick(void) {
+    if (!atomic_load(&g_io_running) || !g_hpipe_out) return;
+    uint8_t buf[64] = {0};
+    buf[0] = 0x37;
+    g_hb_seq = g_seq++;
+    memcpy(buf + 1, &g_hb_seq, 4);
+    arc4random_buf(buf + 5, 8);
+    NSMutableData *d = [NSMutableData dataWithBytes:buf length:64];
+    pthread_mutex_lock(&g_hout_mtx);
+    [g_hpipe_out enqueueIORequestWithData:d completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) { (void)s; (void)n; }];
+    pthread_mutex_unlock(&g_hout_mtx);
+}
+
+static void hb_start(void) {
+    if (g_hb_timer || !g_q) return;
+    g_hb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
+    dispatch_source_set_timer(g_hb_timer, dispatch_time(DISPATCH_TIME_NOW, 0), HEARTBEAT_MS * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_hb_timer, ^{ hb_tick(); });
+    dispatch_resume(g_hb_timer);
+}
+
+static void hb_stop(void) {
+    if (!g_hb_timer) return;
+    dispatch_source_cancel(g_hb_timer);
+    g_hb_timer = nil;
+}
+
+static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2, uint32_t *out_mps) {
     const IOUSBConfigurationDescriptor *cfg = intf.configurationDescriptor;
     const IOUSBInterfaceDescriptor *ifd = intf.interfaceDescriptor;
     if (cfg && ifd) {
@@ -290,7 +334,11 @@ static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uin
             if (IOUSBGetEndpointDirection(ep) == dir && IOUSBGetEndpointType(ep) == kIOUSBEndpointTypeIsochronous) {
                 NSError *e = nil;
                 IOUSBHostPipe *p = [intf copyPipeWithAddress:ep->bEndpointAddress error:&e];
-                if (p) return p;
+                if (p) {
+                    uint32_t mps = OSSwapLittleToHostInt16(ep->wMaxPacketSize) & 0x7FF;
+                    if (mps >= FRAME_BYTES && mps <= PKT_BUF_MAX && out_mps) *out_mps = mps;
+                    return p;
+                }
             }
         }
     }
@@ -346,7 +394,7 @@ static void play_submit(int idx) {
             g_faccum %= 8000;
         }
         if (n < 4) n = 5;
-        if (n * FRAME_BYTES > PKT_MAX) n = PKT_MAX / FRAME_BYTES;
+        if ((uint32_t)(n * FRAME_BYTES) > g_play_pkt_max) n = g_play_pkt_max / FRAME_BYTES;
         pkt_n[k] = n;
         total_frames += n;
     }
@@ -356,10 +404,10 @@ static void play_submit(int idx) {
         int n = pkt_n[k];
         tx[k] = (IOUSBHostIsochronousTransaction){
             .requestCount = (uint32_t)(n * FRAME_BYTES),
-            .offset = (uint32_t)(k * PKT_MAX)
+            .offset = (uint32_t)(k * g_play_pkt_max)
         };
 
-        uint8_t *dst = buf + k * PKT_MAX;
+        uint8_t *dst = buf + k * g_play_pkt_max;
         for (int s = 0; s < n; s++) {
             uint32_t ridx = ((uint32_t)(rp & RING_MASK)) * NCH;
             uint8_t *q = dst + s * FRAME_BYTES;
@@ -377,7 +425,7 @@ static void play_submit(int idx) {
 
     atomic_fetch_add(&g_play_inflight, 1);
     NSError *e = nil;
-    [g_ppipe enqueueIORequestWithData:xf->buf
+    BOOL queued = [g_ppipe enqueueIORequestWithData:xf->buf
                       transactionList:tx
                   transactionListCount:PLAY_PKTS
                       firstFrameNumber:f
@@ -389,6 +437,7 @@ static void play_submit(int idx) {
             play_submit(idx);
         }
     }];
+    if (!queued) atomic_fetch_sub(&g_play_inflight, 1);
 }
 
 static void cap_submit(int idx) {
@@ -400,8 +449,8 @@ static void cap_submit(int idx) {
 
     for (int k = 0; k < CAP_PKTS; k++) {
         tx[k] = (IOUSBHostIsochronousTransaction){
-            .requestCount = PKT_MAX,
-            .offset = (uint32_t)(k * PKT_MAX)
+            .requestCount = g_cap_pkt_max,
+            .offset = (uint32_t)(k * g_cap_pkt_max)
         };
     }
 
@@ -420,6 +469,7 @@ static void cap_submit(int idx) {
         uint64_t ts = 0;
 
         for (int k = 0; k < CAP_PKTS; k++) {
+            if (done[k].status != kIOReturnSuccess || done[k].completeCount > g_cap_pkt_max) continue;
             int n = done[k].completeCount / FRAME_BYTES;
             if (n >= 4) {
                 uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_relaxed);
@@ -431,7 +481,7 @@ static void cap_submit(int idx) {
             }
             if (n > 0) {
                 if (!ts) ts = done[k].timeStamp;
-                const uint8_t *p = b + k * PKT_MAX;
+                const uint8_t *p = b + k * g_cap_pkt_max;
                 for (int s = 0; s < n; s++) {
                     const uint8_t *q = p + s * FRAME_BYTES;
                     float *fr = &g_in_ring[(( wp + got ) & RING_MASK) * NCH];
@@ -545,11 +595,14 @@ static bool usb_open_all(void) {
 
     send_hw_samplerate((int)g_sr);
 
+    g_play_pkt_max = PKT_MAX;
+    g_cap_pkt_max  = PKT_MAX;
+
     [g_play selectAlternateSetting:1 error:&e];
-    g_ppipe = copy_isoch_pipe(g_play, kIOUSBEndpointDirectionOut, EP_PLAY, 0x06);
+    g_ppipe = copy_isoch_pipe(g_play, kIOUSBEndpointDirectionOut, EP_PLAY, 0x02, &g_play_pkt_max);
 
     [g_cap selectAlternateSetting:1 error:&e];
-    g_cpipe = copy_isoch_pipe(g_cap, kIOUSBEndpointDirectionIn, EP_CAP, 0x82);
+    g_cpipe = copy_isoch_pipe(g_cap, kIOUSBEndpointDirectionIn, EP_CAP, 0x86, &g_cap_pkt_max);
 
     if (!g_ppipe || !g_cpipe) {
         LOG("Failed to open Isoch pipes");
@@ -557,15 +610,16 @@ static bool usb_open_all(void) {
     }
 
     for (int i = 0; i < CAP_NXF; i++) {
-        if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
+        if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_BUF_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
     }
     for (int i = 0; i < PLAY_NXF; i++) {
-        if (!g_play_xf[i].buf) g_play_xf[i].buf = [NSMutableData dataWithLength:PLAY_PKTS * PKT_MAX];
+        if (!g_play_xf[i].buf) g_play_xf[i].buf = [NSMutableData dataWithLength:PLAY_PKTS * PKT_BUF_MAX];
         if (!g_play_xf[i].tx)  g_play_xf[i].tx  = calloc(PLAY_PKTS, sizeof(IOUSBHostIsochronousTransaction));
     }
 
     set_usb_switches(true);
+    hb_start();
 
     memset(g_in_ring, 0, sizeof(g_in_ring));
     memset(g_out_ring, 0, sizeof(g_out_ring));
@@ -590,6 +644,7 @@ static bool usb_open_all(void) {
 
 static void usb_stop_streaming(void) {
     if (!atomic_exchange(&g_io_running, false)) return;
+    hb_stop();
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
     if (g_cap)   [g_cap selectAlternateSetting:0 error:nil];
@@ -762,6 +817,7 @@ static Boolean SL4_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
             case kSL4PropHIDCommand:
             case kSL4PropStatus:
             case kSL4PropUnsolQueue:
+            case kAudioObjectPropertyCustomPropertyInfoList:
                 return true;
         }
         return false;
@@ -869,6 +925,7 @@ static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kSL4PropHIDCommand:
             case kSL4PropStatus:
             case kSL4PropUnsolQueue: *outSize = sizeof(CFDataRef); return 0;
+            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         }
     }
     if (oid == kObjStreamIn || oid == kObjStreamOut) {
@@ -933,7 +990,9 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyLatency: *(UInt32*)outData = 32; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertySafetyOffset: *(UInt32*)outData = 64; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertySafetyOffset:
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? (UInt32)(IN_SAFETY_44 * g_sr / 44100.0) : 64;
+                *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = 2048; *outSize = sizeof(UInt32); return 0;
             case kAudioObjectPropertyOwnedObjects:
@@ -992,6 +1051,18 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                     *(CFStringRef*)outData = CFSTR("");
                 }
                 *outSize = sizeof(CFStringRef);
+                return 0;
+            }
+            case kAudioObjectPropertyCustomPropertyInfoList: {
+                static const AudioServerPlugInCustomPropertyInfo all[3] = {
+                    { kSL4PropHIDCommand, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL4PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL4PropUnsolQueue, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                };
+                UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo);
+                if (n > 3) n = 3;
+                memcpy(outData, all, n * sizeof(AudioServerPlugInCustomPropertyInfo));
+                *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return 0;
             }
             case kSL4PropHIDCommand: {
@@ -1075,7 +1146,7 @@ static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL4PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-            if (cd && CFDataGetLength(cd) <= 64) {
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) <= 64) {
                 memset(g_last_cmd_in, 0, 64);
                 memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
                 if (g_last_cmd_in[0] == 0x31 && CFDataGetLength(cd) >= 7) {
