@@ -68,7 +68,21 @@ static void (*g_port_cb)(RH_usb_port_status_t *) = NULL;
 static void (*g_sr_cb)(SL4_samplerate_t *) = NULL;
 static dispatch_source_t g_poll_timer = nil;
 
-/* Find SL 4 CoreAudio Device ID */
+static bool sl4_on_usb(void) {
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return false;
+    int v = VID, p = PID;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, m);
+    if (s) { IOObjectRelease(s); return true; }
+    return false;
+}
+
+/* Find SL 4 CoreAudio Device ID (waiting up to 2s after USB hot-plug) */
 static AudioObjectID find_hal_device(void) {
     AudioObjectPropertyAddress a = {
         kAudioHardwarePropertyTranslateUIDToDevice,
@@ -76,10 +90,15 @@ static AudioObjectID find_hal_device(void) {
         kAudioObjectPropertyElementMain
     };
     CFStringRef uid = CFSTR("com.rane.sl4.hal.device");
-    AudioObjectID devID = kAudioObjectUnknown;
-    UInt32 sz = sizeof(devID);
-    OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof(uid), &uid, &sz, &devID);
-    return (st == noErr) ? devID : kAudioObjectUnknown;
+    for (int tries = 0; tries < 40; tries++) {
+        AudioObjectID devID = kAudioObjectUnknown;
+        UInt32 sz = sizeof(devID);
+        OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof(uid), &uid, &sz, &devID);
+        if (st == noErr && devID != kAudioObjectUnknown) return devID;
+        if (!sl4_on_usb()) break;
+        usleep(50000);
+    }
+    return kAudioObjectUnknown;
 }
 
 static bool hal_get_status(SL4StatusPacket *outSt) {

@@ -39,11 +39,15 @@
 #define PKT_MAX      280     /* wMaxPacketSize of EP 0x06/0x82: 7 frames * 40 bytes per microframe */
 #define PKT_BUF_MAX  720     /* max buffer stride per microframe */
 #define HEARTBEAT_MS 100
-#define IN_SAFETY_44 900     /* input safety offset in frames at 44.1 kHz (~20 ms) */
+#define IN_SAFETY_44  176    /* input safety offset in frames at 44.1 kHz (~4.0 ms) */
+#define OUT_SAFETY_44 132    /* output safety offset in frames at 44.1 kHz (~3.0 ms, with late-write) */
+#define LAT_IN_44     23     /* input latency in frames at 44.1 kHz (~0.5 ms) */
+#define LAT_OUT_44    66     /* output latency in frames at 44.1 kHz (~1.5 ms) */
+#define ZTS_PERIOD    16384  /* ZeroTimeStampPeriod (>= 10923 required by CoreAudio HAL) */
 #define CAP_PKTS     8       /* 1 ms per transfer */
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
-#define PLAY_NXF     20
+#define PLAY_NXF     64      /* 64 ms deep-scheduled playback queue with late writes from WriteMix */
 #define RING_FRAMES  65536   /* ~1.36s @ 48kHz */
 #define RING_MASK    (RING_FRAMES - 1)
 #define FIFO_N       2048
@@ -52,6 +56,7 @@
 #define kSL4PropHIDCommand  'sl4h'   /* CFDataRef (64B cmd in -> 64B reply out) */
 #define kSL4PropStatus      'sl4s'   /* CFDataRef (SL4StatusPacket out) */
 #define kSL4PropUnsolQueue  'sl4q'   /* CFDataRef (pop queued 64B unsolicited HID reports) */
+#define kSL4PropMeters      'sl4m'   /* CFDataRef (20 Float32 peaks: 10 in + 10 out) */
 
 typedef struct {
     uint32_t connected;
@@ -73,6 +78,18 @@ enum {
     kObjDevice    = 2,
     kObjStreamIn  = 3,
     kObjStreamOut = 4,
+    kObjVolume    = 5,   /* master output volume (element 0) */
+    kObjMute      = 6,   /* master output mute   (element 0) */
+    kObjVolCh1    = 7,   /* Deck 1 Out L (element 1) */
+    kObjVolCh2    = 8,   /* Deck 1 Out R (element 2) */
+    kObjVolCh3    = 9,   /* Deck 2 Out L (element 3) */
+    kObjVolCh4    = 10,  /* Deck 2 Out R (element 4) */
+    kObjVolCh5    = 11,  /* Deck 3 Out L (element 5) */
+    kObjVolCh6    = 12,  /* Deck 3 Out R (element 6) */
+    kObjVolCh7    = 13,  /* Deck 4 Out L (element 7) */
+    kObjVolCh8    = 14,  /* Deck 4 Out R (element 8) */
+    kObjVolCh9    = 15,  /* Aux Out L    (element 9) */
+    kObjVolCh10   = 16,  /* Aux Out R    (element 10) */
 };
 
 static os_log_t g_log;
@@ -126,6 +143,119 @@ static uint64_t g_cap_frame = 0;
 static uint64_t g_play_frame = 0;
 static _Atomic int g_play_inflight = 0;
 
+/* Deep-Schedule Late-Write Playback Ring */
+#define DP_RING 256
+#define DP_MASK (DP_RING - 1)
+typedef struct {
+    _Atomic uint64_t seq;
+    uint64_t frame;
+    uint64_t s0;
+    uint32_t total;
+    uint16_t pkt_n[PLAY_PKTS];
+    uint32_t pkt_off[PLAY_PKTS];
+    uint8_t *buf;
+} dp_slot_t;
+static dp_slot_t g_dp_sched[DP_RING];
+static _Atomic uint64_t g_dp_newest_s0 = 0;
+static _Atomic uint64_t g_dp_newest_frame = 0;
+static _Atomic int g_dp_active = 0;
+static _Atomic int g_dp_writers = 0;
+
+static inline void pack_32lj(uint8_t *q, const float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        float v = fr[c] > 1.0f ? 1.0f : fr[c] < -1.0f ? -1.0f : fr[c];
+        int32_t raw32 = (int32_t)(v * 2147483392.0f);
+        memcpy(q + c * 4, &raw32, 4);
+    }
+}
+
+static void dp_write_frame(uint64_t s, const float *fr) {
+    uint64_t nf = atomic_load_explicit(&g_dp_newest_frame, memory_order_acquire);
+    uint64_t ns0 = atomic_load_explicit(&g_dp_newest_s0, memory_order_relaxed);
+    if (!nf) return;
+    int64_t ds = (int64_t)s - (int64_t)ns0;
+    int64_t df = ds / 44;
+    uint64_t start_f = (int64_t)nf + df - 4 > 0 ? (uint64_t)((int64_t)nf + df - 4) : 1;
+    for (int step = 0; step < 12; step++) {
+        uint64_t f = start_f + (uint64_t)step;
+        dp_slot_t *sl = &g_dp_sched[f & DP_MASK];
+        uint64_t q1 = atomic_load_explicit(&sl->seq, memory_order_acquire);
+        if ((q1 & 1) || sl->frame != f) continue;
+        uint64_t s0 = sl->s0;
+        uint32_t tot = sl->total;
+        uint8_t *buf = sl->buf;
+        if (s >= s0 && s < s0 + tot && buf) {
+            uint32_t rem = (uint32_t)(s - s0);
+            for (int k = 0; k < PLAY_PKTS; k++) {
+                uint16_t pn = sl->pkt_n[k];
+                if (rem < pn) {
+                    uint8_t *q = buf + sl->pkt_off[k] + rem * FRAME_BYTES;
+                    pack_32lj(q, fr);
+                    break;
+                }
+                rem -= pn;
+            }
+            return;
+        }
+        if (s0 > s + 64) break;
+    }
+}
+
+/* Output Volume / Mute (Master + 10 Channels) & Level Meters ('sl4m') */
+#define VOL_MIN_DB (-64.0f)
+#define VOL_MAX_DB   0.0f
+static _Atomic float g_vol_scalar[11] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+};
+static _Atomic float g_vol_applied[NCH] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+};
+static _Atomic UInt32 g_vol_mute = 0;
+static _Atomic float g_meter_peaks[NCH * 2];
+
+static inline float vol_scalar_to_db(float s) {
+    if (s <= 0.0f) return VOL_MIN_DB;
+    if (s >= 1.0f) return VOL_MAX_DB;
+    return VOL_MIN_DB + s * (VOL_MAX_DB - VOL_MIN_DB);
+}
+static inline float vol_db_to_scalar(float db) {
+    if (db <= VOL_MIN_DB) return 0.0f;
+    if (db >= VOL_MAX_DB) return 1.0f;
+    return (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
+}
+static inline float vol_scalar_to_amp(float s) {
+    if (s <= 0.0f) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return powf(10.0f, vol_scalar_to_db(s) / 20.0f);
+}
+static int vol_idx_for_obj(AudioObjectID o) {
+    if (o == kObjVolume) return 0;
+    if (o >= kObjVolCh1 && o <= kObjVolCh10) return (int)(o - kObjVolCh1 + 1);
+    return -1;
+}
+static void vol_apply_frame(float *fr) {
+    UInt32 muted = atomic_load_explicit(&g_vol_mute, memory_order_relaxed);
+    float master = muted ? 0.0f : vol_scalar_to_amp(atomic_load_explicit(&g_vol_scalar[0], memory_order_relaxed));
+    const float step = 1.0f / 220.0f;
+    for (int ch = 0; ch < NCH; ch++) {
+        float ch_amp = vol_scalar_to_amp(atomic_load_explicit(&g_vol_scalar[ch + 1], memory_order_relaxed));
+        float target = master * ch_amp;
+        float g = atomic_load_explicit(&g_vol_applied[ch], memory_order_relaxed);
+        if (g != target) {
+            g = g < target ? fminf(g + step, target) : fmaxf(g - step, target);
+            atomic_store_explicit(&g_vol_applied[ch], g, memory_order_relaxed);
+        }
+        fr[ch] *= g;
+    }
+}
+static void meter_update(int base, const float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        float a = fabsf(fr[c]);
+        float prev = atomic_load_explicit(&g_meter_peaks[base + c], memory_order_relaxed);
+        if (a > prev) atomic_store_explicit(&g_meter_peaks[base + c], a, memory_order_relaxed);
+    }
+}
+
 /* HID state */
 static NSMutableData *g_hbuf_in;
 static _Atomic uint32_t g_seq = 1;
@@ -134,6 +264,8 @@ static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[64];
 static uint8_t  g_last_cmd_in[64];
+static uint8_t  g_last_cmd_reply[64];
+static _Atomic int g_pending_sr = 48000;
 static SL4StatusPacket g_st;
 
 /* 0x37 heartbeat (8 random challenge bytes, the box answers with 8 derived bytes) */
@@ -399,29 +531,41 @@ static void play_submit(int idx) {
         total_frames += n;
     }
 
-    uint64_t rp = atomic_fetch_add_explicit(&g_total_play_frames, total_frames, memory_order_acq_rel);
+    uint64_t rp0 = atomic_fetch_add_explicit(&g_total_play_frames, total_frames, memory_order_acq_rel);
+    uint64_t rp = rp0;
+    dp_slot_t *sl = &g_dp_sched[f & DP_MASK];
+    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
+    sl->frame = f;
+    sl->s0 = rp0;
+    sl->total = (uint32_t)total_frames;
+    sl->buf = buf;
+
     for (int k = 0; k < PLAY_PKTS; k++) {
         int n = pkt_n[k];
+        uint32_t off = (uint32_t)(k * g_play_pkt_max);
+        sl->pkt_n[k] = (uint16_t)n;
+        sl->pkt_off[k] = off;
         tx[k] = (IOUSBHostIsochronousTransaction){
             .requestCount = (uint32_t)(n * FRAME_BYTES),
-            .offset = (uint32_t)(k * g_play_pkt_max)
+            .offset = off
         };
 
-        uint8_t *dst = buf + k * g_play_pkt_max;
+        uint8_t *dst = buf + off;
         for (int s = 0; s < n; s++) {
             uint32_t ridx = ((uint32_t)(rp & RING_MASK)) * NCH;
             uint8_t *q = dst + s * FRAME_BYTES;
+            float fr[NCH];
             for (int c = 0; c < NCH; c++) {
-                float v = g_out_ring[ridx + c];
+                fr[c] = g_out_ring[ridx + c];
                 g_out_ring[ridx + c] = 0.0f;
-                if (v > 1.0f) v = 1.0f;
-                else if (v < -1.0f) v = -1.0f;
-                int32_t raw32 = (int32_t)(v * 2147483392.0f);
-                memcpy(q + c * 4, &raw32, 4);
             }
+            pack_32lj(q, fr);
             rp++;
         }
     }
+    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
+    atomic_store_explicit(&g_dp_newest_s0, rp0, memory_order_relaxed);
+    atomic_store_explicit(&g_dp_newest_frame, f, memory_order_release);
 
     atomic_fetch_add(&g_play_inflight, 1);
     NSError *e = nil;
@@ -432,6 +576,7 @@ static void play_submit(int idx) {
                                options:IOUSBHostIsochronousTransferOptionsNone
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+        (void)done;
         atomic_fetch_sub(&g_play_inflight, 1);
         if (atomic_load(&g_io_running) && st != kIOReturnAborted) {
             play_submit(idx);
@@ -491,6 +636,7 @@ static void cap_submit(int idx) {
                         int32_t s24 = raw32 >> 8;
                         fr[c] = (float)s24 * (1.0f / 8388608.0f);
                     }
+                    meter_update(0, fr);
                     got++;
                 }
             }
@@ -498,8 +644,8 @@ static void cap_submit(int idx) {
         if (got > 0) clk_update(got, ts);
 
         if (atomic_load(&g_play_inflight) == 0 &&
-            (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= PLAY_NXF * PLAY_PKTS) {
-            g_play_frame = [g_dev frameNumberWithTime:NULL] + 24;
+            (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= 2 * PLAY_PKTS) {
+            g_play_frame = [g_dev frameNumberWithTime:NULL] + 2;
             for (int j = 0; j < PLAY_NXF; j++) play_submit(j);
         }
         cap_submit(idx);
@@ -623,6 +769,10 @@ static bool usb_open_all(void) {
 
     memset(g_in_ring, 0, sizeof(g_in_ring));
     memset(g_out_ring, 0, sizeof(g_out_ring));
+    memset(g_dp_sched, 0, sizeof(g_dp_sched));
+    atomic_store(&g_dp_newest_s0, 0);
+    atomic_store(&g_dp_newest_frame, 0);
+    atomic_store(&g_dp_active, 1);
     atomic_store(&g_fifo_w, 0);
     atomic_store(&g_fifo_r, 0);
     atomic_store(&g_play_inflight, 0);
@@ -635,7 +785,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_total_play_frames, 0);
 
     atomic_store(&g_io_running, true);
-    g_cap_frame = [g_dev frameNumberWithTime:NULL] + 4;
+    g_cap_frame = [g_dev frameNumberWithTime:NULL] + 2;
     for (int i = 0; i < CAP_NXF; i++) cap_submit(i);
 
     LOG("Streaming started on Rane SL 4 (%.0f Hz)", g_sr);
@@ -644,6 +794,10 @@ static bool usb_open_all(void) {
 
 static void usb_stop_streaming(void) {
     if (!atomic_exchange(&g_io_running, false)) return;
+    atomic_store_explicit(&g_dp_active, 0, memory_order_release);
+    while (atomic_load_explicit(&g_dp_writers, memory_order_acquire) > 0) {
+        usleep(50);
+    }
     hb_stop();
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
@@ -667,23 +821,33 @@ static void usb_close_all(void) {
 
 static void notify_alive_changed(void) {
     if (!g_host) return;
-    AudioObjectPropertyAddress addr = {
+    AudioObjectPropertyAddress dev_addr = {
         kAudioDevicePropertyDeviceIsAlive,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-    g_host->PropertiesChanged(g_host, kObjDevice, 1, &addr);
+    g_host->PropertiesChanged(g_host, kObjDevice, 1, &dev_addr);
+    AudioObjectPropertyAddress plug_addrs[2] = {
+        { kAudioPlugInPropertyDeviceList,   kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+    };
+    g_host->PropertiesChanged(g_host, kObjPlugIn, 2, plug_addrs);
 }
 
 static void on_usb_added(void *refcon, io_iterator_t iter) {
+    (void)refcon;
     io_service_t s;
     bool found = false;
     while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); found = true; }
     if (found) {
         LOG("Rane SL 4 USB connected");
-        pthread_mutex_lock(&g_mutex);
-        usb_ensure_hid();
-        pthread_mutex_unlock(&g_mutex);
+        for (int attempt = 0; attempt < 5; attempt++) {
+            pthread_mutex_lock(&g_mutex);
+            bool ok = usb_ensure_hid();
+            pthread_mutex_unlock(&g_mutex);
+            if (ok) break;
+            usleep(100000);
+        }
         notify_alive_changed();
     }
 }
@@ -758,14 +922,42 @@ static OSStatus SL4_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     return kAudioHardwareNoError;
 }
 
-static OSStatus SL4_CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *ci, AudioObjectID *outID) { return kAudioHardwareUnsupportedOperationError; }
-static OSStatus SL4_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id) { return kAudioHardwareUnsupportedOperationError; }
-static OSStatus SL4_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
-static OSStatus SL4_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
-static OSStatus SL4_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
-static OSStatus SL4_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
+static OSStatus SL4_CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *ci, AudioObjectID *outID) { (void)d; (void)desc; (void)ci; (void)outID; return kAudioHardwareUnsupportedOperationError; }
+static OSStatus SL4_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id) { (void)d; (void)id; return kAudioHardwareUnsupportedOperationError; }
+static OSStatus SL4_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { (void)d; (void)id; (void)ci; return kAudioHardwareNoError; }
+static OSStatus SL4_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { (void)d; (void)id; (void)ci; return kAudioHardwareNoError; }
+
+static void apply_sample_rate_change(int sr) {
+    if (sr != 44100 && sr != 48000) return;
+    g_sr = (Float64)sr;
+    double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
+    atomic_store(&g_ticks_per_frame, nom);
+    pthread_mutex_lock(&g_mutex);
+    if (usb_ensure_hid()) send_hw_samplerate(sr);
+    pthread_mutex_unlock(&g_mutex);
+    if (g_host) {
+        AudioObjectPropertyAddress da = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        g_host->PropertiesChanged(g_host, kObjDevice, 1, &da);
+        AudioObjectPropertyAddress sa[2] = {
+            { kAudioStreamPropertyVirtualFormat,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+        };
+        g_host->PropertiesChanged(g_host, kObjStreamIn, 2, sa);
+        g_host->PropertiesChanged(g_host, kObjStreamOut, 2, sa);
+    }
+}
+
+static OSStatus SL4_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) {
+    (void)d; (void)id; (void)info;
+    if (action == 1) {
+        apply_sample_rate_change(atomic_load(&g_pending_sr));
+    }
+    return kAudioHardwareNoError;
+}
+static OSStatus SL4_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { (void)d; (void)id; (void)action; (void)info; return kAudioHardwareNoError; }
 
 static Boolean SL4_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr) {
+    (void)d; (void)pid;
     if (!addr) return false;
     AudioObjectPropertySelector s = addr->mSelector;
     AudioObjectPropertyScope sc = addr->mScope;
@@ -817,6 +1009,7 @@ static Boolean SL4_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
             case kSL4PropHIDCommand:
             case kSL4PropStatus:
             case kSL4PropUnsolQueue:
+            case kSL4PropMeters:
             case kAudioObjectPropertyCustomPropertyInfoList:
                 return true;
         }
@@ -842,16 +1035,52 @@ static Boolean SL4_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
         }
         return false;
     }
+    if (vol_idx_for_obj(oid) >= 0) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioControlPropertyScope:
+            case kAudioControlPropertyElement:
+            case kAudioLevelControlPropertyScalarValue:
+            case kAudioLevelControlPropertyDecibelValue:
+            case kAudioLevelControlPropertyDecibelRange:
+            case kAudioLevelControlPropertyConvertScalarToDecibels:
+            case kAudioLevelControlPropertyConvertDecibelsToScalar:
+                return true;
+        }
+        return false;
+    }
+    if (oid == kObjMute) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioControlPropertyScope:
+            case kAudioControlPropertyElement:
+            case kAudioBooleanControlPropertyValue:
+                return true;
+        }
+        return false;
+    }
     (void)sc;
     return false;
 }
 
 static OSStatus SL4_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, Boolean *outSettable) {
+    (void)d; (void)pid;
     *outSettable = false;
     if (oid == kObjDevice && (addr->mSelector == kAudioDevicePropertyNominalSampleRate || addr->mSelector == kSL4PropHIDCommand)) {
         *outSettable = true;
     } else if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
                (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+        *outSettable = true;
+    } else if (vol_idx_for_obj(oid) >= 0 &&
+               (addr->mSelector == kAudioLevelControlPropertyScalarValue || addr->mSelector == kAudioLevelControlPropertyDecibelValue)) {
+        *outSettable = true;
+    } else if (oid == kObjMute && addr->mSelector == kAudioBooleanControlPropertyValue) {
         *outSettable = true;
     }
     return kAudioHardwareNoError;
@@ -870,6 +1099,7 @@ static void fill_asbd(AudioStreamBasicDescription *a, Float64 sr) {
 }
 
 static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 *outSize) {
+    (void)d; (void)pid; (void)qsz; (void)qd;
     AudioObjectPropertySelector s = addr->mSelector;
     AudioObjectPropertyScope sc = addr->mScope;
 
@@ -881,7 +1111,9 @@ static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioObjectPropertyManufacturer:
             case kAudioPlugInPropertyResourceBundle: *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
-            case kAudioPlugInPropertyDeviceList: *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioPlugInPropertyDeviceList:
+                *outSize = (atomic_load(&g_hw_connected) || g_io_clients > 0) ? sizeof(AudioObjectID) : 0;
+                return 0;
             case kAudioPlugInPropertyTranslateUIDToDevice: *outSize = sizeof(AudioObjectID); return 0;
         }
     }
@@ -908,14 +1140,17 @@ static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioDevicePropertyZeroTimeStampPeriod: *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyRelatedDevices: *outSize = sizeof(AudioObjectID); return 0;
             case kAudioObjectPropertyOwnedObjects:
-                *outSize = (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput)
-                         ? sizeof(AudioObjectID) : 2 * sizeof(AudioObjectID);
+                if (sc == kAudioObjectPropertyScopeInput) *outSize = sizeof(AudioObjectID);
+                else if (sc == kAudioObjectPropertyScopeOutput) *outSize = 13 * sizeof(AudioObjectID);
+                else *outSize = 14 * sizeof(AudioObjectID);
                 return 0;
             case kAudioDevicePropertyStreams:
                 if (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput) *outSize = sizeof(AudioObjectID);
                 else *outSize = 2 * sizeof(AudioObjectID);
                 return 0;
-            case kAudioObjectPropertyControlList: *outSize = 0; return 0;
+            case kAudioObjectPropertyControlList:
+                *outSize = (sc == kAudioObjectPropertyScopeInput) ? 0 : 12 * sizeof(AudioObjectID);
+                return 0;
             case kAudioDevicePropertyNominalSampleRate: *outSize = sizeof(Float64); return 0;
             case kAudioDevicePropertyAvailableNominalSampleRates: *outSize = 2 * sizeof(AudioValueRange); return 0;
             case kAudioDevicePropertyPreferredChannelsForStereo: *outSize = 2 * sizeof(UInt32); return 0;
@@ -924,8 +1159,9 @@ static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
                 return 0;
             case kSL4PropHIDCommand:
             case kSL4PropStatus:
-            case kSL4PropUnsolQueue: *outSize = sizeof(CFDataRef); return 0;
-            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
+            case kSL4PropUnsolQueue:
+            case kSL4PropMeters: *outSize = sizeof(CFDataRef); return 0;
+            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 4 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         }
     }
     if (oid == kObjStreamIn || oid == kObjStreamOut) {
@@ -946,10 +1182,37 @@ static OSStatus SL4_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioStreamPropertyAvailablePhysicalFormats: *outSize = 2 * sizeof(AudioStreamRangedDescription); return 0;
         }
     }
+    if (vol_idx_for_obj(oid) >= 0) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass: *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyOwnedObjects: *outSize = 0; return 0;
+            case kAudioControlPropertyScope:
+            case kAudioControlPropertyElement: *outSize = sizeof(UInt32); return 0;
+            case kAudioLevelControlPropertyScalarValue:
+            case kAudioLevelControlPropertyDecibelValue:
+            case kAudioLevelControlPropertyConvertScalarToDecibels:
+            case kAudioLevelControlPropertyConvertDecibelsToScalar: *outSize = sizeof(Float32); return 0;
+            case kAudioLevelControlPropertyDecibelRange: *outSize = sizeof(AudioValueRange); return 0;
+        }
+    }
+    if (oid == kObjMute) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass: *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyOwnedObjects: *outSize = 0; return 0;
+            case kAudioControlPropertyScope:
+            case kAudioControlPropertyElement:
+            case kAudioBooleanControlPropertyValue: *outSize = sizeof(UInt32); return 0;
+        }
+    }
     return kAudioHardwareUnknownPropertyError;
 }
 
 static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
+    (void)d; (void)pid; (void)qsz;
     AudioObjectPropertySelector s = addr->mSelector;
     AudioObjectPropertyScope sc = addr->mScope;
 
@@ -962,10 +1225,16 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioPlugInPropertyResourceBundle: *(CFStringRef*)outData = CFSTR(""); *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
             case kAudioPlugInPropertyDeviceList:
-                *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+                if ((atomic_load(&g_hw_connected) || g_io_clients > 0) && inSize >= sizeof(AudioObjectID)) {
+                    *(AudioObjectID*)outData = kObjDevice;
+                    *outSize = sizeof(AudioObjectID);
+                } else {
+                    *outSize = 0;
+                }
+                return 0;
             case kAudioPlugInPropertyTranslateUIDToDevice: {
                 CFStringRef u = *(CFStringRef*)qd;
-                *(AudioObjectID*)outData = (u && CFEqual(u, CFSTR("com.rane.sl4.hal.device"))) ? kObjDevice : kAudioObjectUnknown;
+                *(AudioObjectID*)outData = (u && CFEqual(u, CFSTR("com.rane.sl4.hal.device")) && (atomic_load(&g_hw_connected) || g_io_clients > 0)) ? kObjDevice : kAudioObjectUnknown;
                 *outSize = sizeof(AudioObjectID);
                 return 0;
             }
@@ -985,17 +1254,44 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioDevicePropertyTransportType: *(UInt32*)outData = kAudioDeviceTransportTypeUSB; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyRelatedDevices: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
             case kAudioDevicePropertyClockDomain: *(UInt32*)outData = 0x52414E34; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyDeviceIsAlive: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyDeviceIsAlive: *(UInt32*)outData = (atomic_load(&g_hw_connected) || g_io_clients > 0) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyDeviceIsRunning: *(UInt32*)outData = (g_io_clients > 0) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyLatency: *(UInt32*)outData = 32; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyLatency:
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput)
+                                  ? (UInt32)llround(LAT_IN_44 * g_sr / 44100.0)
+                                  : (UInt32)llround(LAT_OUT_44 * g_sr / 44100.0);
+                *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertySafetyOffset:
-                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? (UInt32)(IN_SAFETY_44 * g_sr / 44100.0) : 64;
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput)
+                                  ? (UInt32)llround(IN_SAFETY_44 * g_sr / 44100.0)
+                                  : (UInt32)llround(OUT_SAFETY_44 * g_sr / 44100.0);
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = 2048; *outSize = sizeof(UInt32); return 0;
-            case kAudioObjectPropertyOwnedObjects:
+            case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = ZTS_PERIOD; *outSize = sizeof(UInt32); return 0;
+            case kAudioObjectPropertyOwnedObjects: {
+                static const AudioObjectID inObjs[1] = { kObjStreamIn };
+                static const AudioObjectID outObjs[13] = {
+                    kObjStreamOut, kObjVolume, kObjMute,
+                    kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjVolCh5,
+                    kObjVolCh6, kObjVolCh7, kObjVolCh8, kObjVolCh9, kObjVolCh10
+                };
+                static const AudioObjectID allObjs[14] = {
+                    kObjStreamIn, kObjStreamOut, kObjVolume, kObjMute,
+                    kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjVolCh5,
+                    kObjVolCh6, kObjVolCh7, kObjVolCh8, kObjVolCh9, kObjVolCh10
+                };
+                const AudioObjectID *src = allObjs;
+                UInt32 cnt = 14;
+                if (sc == kAudioObjectPropertyScopeInput) { src = inObjs; cnt = 1; }
+                else if (sc == kAudioObjectPropertyScopeOutput) { src = outObjs; cnt = 13; }
+                UInt32 n = inSize / sizeof(AudioObjectID);
+                if (n > cnt) n = cnt;
+                memcpy(outData, src, n * sizeof(AudioObjectID));
+                *outSize = n * sizeof(AudioObjectID);
+                return 0;
+            }
             case kAudioDevicePropertyStreams: {
                 AudioObjectID *ids = (AudioObjectID*)outData;
                 if (sc == kAudioObjectPropertyScopeInput) { ids[0] = kObjStreamIn; *outSize = sizeof(AudioObjectID); }
@@ -1003,7 +1299,19 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 else { ids[0] = kObjStreamIn; ids[1] = kObjStreamOut; *outSize = 2 * sizeof(AudioObjectID); }
                 return 0;
             }
-            case kAudioObjectPropertyControlList: *outSize = 0; return 0;
+            case kAudioObjectPropertyControlList: {
+                if (sc == kAudioObjectPropertyScopeInput) { *outSize = 0; return 0; }
+                static const AudioObjectID ctrls[12] = {
+                    kObjVolume, kObjMute,
+                    kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjVolCh5,
+                    kObjVolCh6, kObjVolCh7, kObjVolCh8, kObjVolCh9, kObjVolCh10
+                };
+                UInt32 n = inSize / sizeof(AudioObjectID);
+                if (n > 12) n = 12;
+                memcpy(outData, ctrls, n * sizeof(AudioObjectID));
+                *outSize = n * sizeof(AudioObjectID);
+                return 0;
+            }
             case kAudioDevicePropertyNominalSampleRate: *(Float64*)outData = g_sr; *outSize = sizeof(Float64); return 0;
             case kAudioDevicePropertyAvailableNominalSampleRates: {
                 AudioValueRange *r = (AudioValueRange*)outData;
@@ -1054,26 +1362,22 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 return 0;
             }
             case kAudioObjectPropertyCustomPropertyInfoList: {
-                static const AudioServerPlugInCustomPropertyInfo all[3] = {
+                static const AudioServerPlugInCustomPropertyInfo all[4] = {
                     { kSL4PropHIDCommand, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL4PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL4PropUnsolQueue, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL4PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 };
                 UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo);
-                if (n > 3) n = 3;
+                if (n > 4) n = 4;
                 memcpy(outData, all, n * sizeof(AudioServerPlugInCustomPropertyInfo));
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return 0;
             }
             case kSL4PropHIDCommand: {
                 pthread_mutex_lock(&g_mutex);
-                usb_ensure_hid();
-                uint8_t reply[64] = {0};
-                uint32_t seq_in = 0;
-                memcpy(&seq_in, g_last_cmd_in + 1, 4);
-                hid_cmd(g_last_cmd_in[0], g_last_cmd_in + 5, 59, reply, seq_in ? &seq_in : NULL);
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, g_last_cmd_reply, 64);
                 pthread_mutex_unlock(&g_mutex);
-                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, reply, 64);
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
@@ -1104,6 +1408,15 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
+            case kSL4PropMeters: {
+                float peaks[NCH * 2];
+                for (int i = 0; i < NCH * 2; i++) {
+                    peaks[i] = atomic_exchange_explicit(&g_meter_peaks[i], 0.0f, memory_order_relaxed);
+                }
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)peaks, sizeof(peaks));
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
         }
     }
 
@@ -1121,7 +1434,11 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 *(UInt32*)outData = (oid == kObjStreamIn) ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeSpeaker;
                 *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyStartingChannel: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
-            case kAudioStreamPropertyLatency: *(UInt32*)outData = 32; *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyLatency:
+                *(UInt32*)outData = (oid == kObjStreamIn)
+                                  ? (UInt32)llround(LAT_IN_44 * g_sr / 44100.0)
+                                  : (UInt32)llround(LAT_OUT_44 * g_sr / 44100.0);
+                *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyVirtualFormat:
             case kAudioStreamPropertyPhysicalFormat:
                 fill_asbd((AudioStreamBasicDescription*)outData, g_sr);
@@ -1139,14 +1456,60 @@ static OSStatus SL4_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             }
         }
     }
+
+    int vidx = vol_idx_for_obj(oid);
+    if (vidx >= 0) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass: *(AudioClassID*)outData = kAudioLevelControlClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyClass: *(AudioClassID*)outData = kAudioVolumeControlClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyOwnedObjects: *outSize = 0; return 0;
+            case kAudioControlPropertyScope: *(UInt32*)outData = kAudioObjectPropertyScopeOutput; *outSize = sizeof(UInt32); return 0;
+            case kAudioControlPropertyElement: *(UInt32*)outData = (UInt32)vidx; *outSize = sizeof(UInt32); return 0;
+            case kAudioLevelControlPropertyScalarValue:
+                *(Float32*)outData = atomic_load_explicit(&g_vol_scalar[vidx], memory_order_relaxed);
+                *outSize = sizeof(Float32); return 0;
+            case kAudioLevelControlPropertyDecibelValue:
+                *(Float32*)outData = vol_scalar_to_db(atomic_load_explicit(&g_vol_scalar[vidx], memory_order_relaxed));
+                *outSize = sizeof(Float32); return 0;
+            case kAudioLevelControlPropertyDecibelRange: {
+                AudioValueRange *r = (AudioValueRange*)outData;
+                r->mMinimum = VOL_MIN_DB; r->mMaximum = VOL_MAX_DB;
+                *outSize = sizeof(AudioValueRange); return 0;
+            }
+            case kAudioLevelControlPropertyConvertScalarToDecibels:
+                *(Float32*)outData = vol_scalar_to_db(*(Float32*)outData);
+                *outSize = sizeof(Float32); return 0;
+            case kAudioLevelControlPropertyConvertDecibelsToScalar:
+                *(Float32*)outData = vol_db_to_scalar(*(Float32*)outData);
+                *outSize = sizeof(Float32); return 0;
+        }
+    }
+
+    if (oid == kObjMute) {
+        switch (s) {
+            case kAudioObjectPropertyBaseClass: *(AudioClassID*)outData = kAudioBooleanControlClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyClass: *(AudioClassID*)outData = kAudioMuteControlClassID; *outSize = sizeof(AudioClassID); return 0;
+            case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioObjectPropertyOwnedObjects: *outSize = 0; return 0;
+            case kAudioControlPropertyScope: *(UInt32*)outData = kAudioObjectPropertyScopeOutput; *outSize = sizeof(UInt32); return 0;
+            case kAudioControlPropertyElement: *(UInt32*)outData = kAudioObjectPropertyElementMain; *outSize = sizeof(UInt32); return 0;
+            case kAudioBooleanControlPropertyValue:
+                *(UInt32*)outData = atomic_load_explicit(&g_vol_mute, memory_order_relaxed);
+                *outSize = sizeof(UInt32); return 0;
+        }
+    }
+
     return kAudioHardwareUnknownPropertyError;
 }
 
 static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, const void *inData) {
+    (void)d; (void)pid; (void)qsz; (void)qd;
     if (oid == kObjDevice && addr->mSelector == kSL4PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) <= 64) {
+                pthread_mutex_lock(&g_mutex);
                 memset(g_last_cmd_in, 0, 64);
                 memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
                 if (g_last_cmd_in[0] == 0x31 && CFDataGetLength(cd) >= 7) {
@@ -1156,6 +1519,12 @@ static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                         push_sr_unsol(sr);
                     }
                 }
+                usb_ensure_hid();
+                memset(g_last_cmd_reply, 0, 64);
+                uint32_t seq_in = 0;
+                memcpy(&seq_in, g_last_cmd_in + 1, 4);
+                hid_cmd(g_last_cmd_in[0], g_last_cmd_in + 5, 59, g_last_cmd_reply, seq_in ? &seq_in : NULL);
+                pthread_mutex_unlock(&g_mutex);
             }
         }
         return 0;
@@ -1163,12 +1532,12 @@ static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
         Float64 v = *(const Float64*)inData;
         if (v == 44100.0 || v == 48000.0) {
-            g_sr = v;
-            double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-            atomic_store(&g_ticks_per_frame, nom);
-            pthread_mutex_lock(&g_mutex);
-            if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
-            pthread_mutex_unlock(&g_mutex);
+            atomic_store(&g_pending_sr, (int)v);
+            if (g_host) {
+                g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, 1, NULL);
+            } else {
+                apply_sample_rate_change((int)v);
+            }
         }
         return 0;
     }
@@ -1176,12 +1545,39 @@ static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
         (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
         const AudioStreamBasicDescription *a = (const AudioStreamBasicDescription*)inData;
         if (a->mSampleRate == 44100.0 || a->mSampleRate == 48000.0) {
-            g_sr = a->mSampleRate;
-            double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-            atomic_store(&g_ticks_per_frame, nom);
-            pthread_mutex_lock(&g_mutex);
-            if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
-            pthread_mutex_unlock(&g_mutex);
+            atomic_store(&g_pending_sr, (int)a->mSampleRate);
+            if (g_host) {
+                g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, 1, NULL);
+            } else {
+                apply_sample_rate_change((int)a->mSampleRate);
+            }
+        }
+        return 0;
+    }
+    int vidx = vol_idx_for_obj(oid);
+    if (vidx >= 0) {
+        if (inSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+        Float32 val = *(const Float32*)inData;
+        Float32 sc = (addr->mSelector == kAudioLevelControlPropertyDecibelValue)
+                   ? vol_db_to_scalar(val)
+                   : (val < 0.0f ? 0.0f : (val > 1.0f ? 1.0f : val));
+        atomic_store_explicit(&g_vol_scalar[vidx], sc, memory_order_relaxed);
+        if (g_host) {
+            AudioObjectPropertyAddress ca[2] = {
+                { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+                { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+            };
+            g_host->PropertiesChanged(g_host, oid, 2, ca);
+        }
+        return 0;
+    }
+    if (oid == kObjMute && addr->mSelector == kAudioBooleanControlPropertyValue) {
+        if (inSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        UInt32 m = (*(const UInt32*)inData) ? 1 : 0;
+        atomic_store_explicit(&g_vol_mute, m, memory_order_relaxed);
+        if (g_host) {
+            AudioObjectPropertyAddress ca = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            g_host->PropertiesChanged(g_host, kObjMute, 1, &ca);
         }
         return 0;
     }
@@ -1189,6 +1585,7 @@ static OSStatus SL4_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 }
 
 static OSStatus SL4_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
+    (void)d; (void)oid; (void)cid;
     pthread_mutex_lock(&g_mutex);
     if (g_io_clients == 0) {
         if (!usb_open_all()) {
@@ -1205,6 +1602,7 @@ static OSStatus SL4_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
 }
 
 static OSStatus SL4_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
+    (void)d; (void)oid; (void)cid;
     pthread_mutex_lock(&g_mutex);
     if (g_io_clients > 0) {
         g_io_clients--;
@@ -1215,6 +1613,7 @@ static OSStatus SL4_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt
 }
 
 static OSStatus SL4_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed) {
+    (void)d; (void)oid; (void)cid;
     uint64_t anchor = atomic_load_explicit(&g_anchor_host, memory_order_acquire);
     double tpf = atomic_load_explicit(&g_ticks_per_frame, memory_order_relaxed);
     if (anchor == 0 || tpf <= 0) {
@@ -1222,44 +1621,54 @@ static OSStatus SL4_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
         tpf = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
     }
     uint64_t now = mach_absolute_time();
-    double period_ticks = 2048.0 * tpf;
+    double period_ticks = (double)ZTS_PERIOD * tpf;
     uint64_t periods = (now > anchor) ? (uint64_t)((double)(now - anchor) / period_ticks) : 0;
 
-    *outSampleTime = (Float64)(periods * 2048ULL);
+    *outSampleTime = (Float64)(periods * (uint64_t)ZTS_PERIOD);
     *outHostTime   = anchor + (uint64_t)((double)periods * period_ticks);
     *outSeed       = 1;
     return 0;
 }
 
 static OSStatus SL4_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, Boolean *outWillDo, Boolean *outIsInPlace) {
+    (void)d; (void)oid; (void)cid;
     *outIsInPlace = true;
     *outWillDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix);
     return 0;
 }
 
-static OSStatus SL4_BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { return 0; }
+static OSStatus SL4_BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { (void)d; (void)oid; (void)cid; (void)op; (void)frames; (void)ci; return 0; }
 
 static OSStatus SL4_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, AudioObjectID sid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci, void *ioMain, void *ioSec) {
+    (void)d; (void)oid; (void)sid; (void)cid; (void)ioSec;
     float *buf = (float*)ioMain;
     if (op == kAudioServerPlugInIOOperationReadInput) {
-        uint64_t pos = (uint64_t)ci->mInputTime.mSampleTime;
+        uint64_t pos = (uint64_t)llround(ci->mInputTime.mSampleTime);
         for (UInt32 f = 0; f < frames; f++) {
             uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
             memcpy(buf + f * NCH, &g_in_ring[idx], NCH * sizeof(float));
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
-        uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
+        uint64_t pos = (uint64_t)llround(ci->mOutputTime.mSampleTime);
         for (UInt32 f = 0; f < frames; f++) {
+            float fr[NCH];
+            memcpy(fr, buf + f * NCH, NCH * sizeof(float));
+            vol_apply_frame(fr);
+            meter_update(NCH, fr);
             uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
-            for (int c = 0; c < NCH; c++) {
-                g_out_ring[idx + c] = buf[f * NCH + c];
+            memcpy(&g_out_ring[idx], fr, NCH * sizeof(float));
+            if (atomic_load_explicit(&g_dp_active, memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_acquire);
+                if (atomic_load_explicit(&g_dp_active, memory_order_relaxed))
+                    dp_write_frame(pos + f, fr);
+                atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
             }
         }
     }
     return 0;
 }
 
-static OSStatus SL4_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { return 0; }
+static OSStatus SL4_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci) { (void)d; (void)oid; (void)cid; (void)op; (void)frames; (void)ci; return 0; }
 
 static AudioServerPlugInDriverInterface g_interface = {
     NULL,
