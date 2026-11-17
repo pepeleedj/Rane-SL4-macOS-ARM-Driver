@@ -63,7 +63,7 @@ struct Strokes {
     func outline(_ p: Projection, width: CGFloat, size: CGSize) -> CGPath {
         let flat = CGMutablePath()
         flat.addLines(between: points.map { CGPoint(x: $0.0 * size.width, y: $0.1 * size.height) })
-        let stroked = flat.copy(strokingWithWidth: width, lineCap: .square, lineJoin: .miter, miterLimit: 10)
+        let stroked = flat.copy(strokingWithWidth: width, lineCap: .butt, lineJoin: .miter, miterLimit: 2)
         func project(_ q: CGPoint) -> CGPoint { p(q.x / size.width, q.y / size.height) }
         let path = CGMutablePath()
         stroked.applyWithBlock { element in
@@ -112,9 +112,10 @@ func letter4(_ u0: CGFloat, _ v0: CGFloat, _ u1: CGFloat, _ v1: CGFloat) -> [Str
 }
 
 // Draws on a 1024 × 1024 canvas, origin bottom left; the caller scales the context for other sizes.
-// The picture is a box of the SL family, seen from above and in front: a black box with three panels on
-// top, "SL4" on the middle one, and along its front edge its four decks' RCA sockets, the lights and its
-// two USB sockets (ports A and B).
+// The picture is the SL 4, seen from above and in front: a black box with three panels on top (the outputs'
+// labels, "SL4", the inputs' labels), and on its front the inputs' RCA sockets in five stacked pairs (decks
+// 1-4 and Aux), the four THRU lights, the ground post over its DIP switch, and the two USB sockets (ports A
+// and B) with their lights.
 func drawIcon(_ ctx: CGContext) {
     let space = CGColorSpace(name: CGColorSpace.sRGB)!
     func gradient(_ colours: [CGColor]) -> CGGradient {
@@ -138,7 +139,7 @@ func drawIcon(_ ctx: CGContext) {
     ctx.restoreGState()
 
     // The box: its front face, and its top face in perspective above it.
-    let left: CGFloat = 168, right: CGFloat = 856, frontBottom: CGFloat = 262, frontTop: CGFloat = 352
+    let left: CGFloat = 168, right: CGFloat = 856, frontBottom: CGFloat = 214, frontTop: CGFloat = 372
     let top = Projection(CGPoint(x: left, y: frontTop), CGPoint(x: right, y: frontTop),
                          CGPoint(x: right - 62, y: 760), CGPoint(x: left + 62, y: 760))
     let outline = CGMutablePath()
@@ -187,76 +188,120 @@ func drawIcon(_ ctx: CGContext) {
         ctx.strokePath()
     }
 
-    // The deck brackets on the front (outputs) and back (inputs) panels, one per deck, their prongs
-    // pointing to the sockets on the edge beside them, joined in red.
-    let sockets: [CGFloat] = [208, 262, 320, 374, 432, 486, 544, 598]
-    let socketU = sockets.map { ($0 - left) / (right - left) }
-    ctx.setLineWidth(3)
-    for (v, lift) in [(CGFloat(0.13), CGFloat(0.05)), (0.84, -0.05)] {
-        for deck in 0..<4 {
-            let (u0, u1) = (socketU[2 * deck], socketU[2 * deck + 1])
-            var bracket = Strokes()
-            bracket.line(u0, v - lift); bracket.line(u0, v); bracket.line(u1, v); bracket.line(u1, v - lift)
-            ctx.addPath(bracket.path(top))
-            ctx.setStrokeColor(rgb(0.92, 0.92, 0.93, 0.85))
-            ctx.strokePath()
+    // The labels' brackets on the back (outputs) and front (inputs) panels: a line along the panel with a tick
+    // over the middle of each socket pair (1, 2, 3, 4 and AUX), pointing away from the red label, which is on
+    // the line's other side: on the back panel the ticks point back, on the front panel forwards.
+    let columns: [CGFloat] = [212, 268, 336, 392, 460]   /* the RCA pairs' centres on the front, below */
+    let ticks = columns.map { ($0 - left) / (right - left) }
+    for (v, lift, label) in [(CGFloat(0.86), CGFloat(0.04), CGFloat(0.80)), (0.14, -0.04, 0.20)] {
+        var line = Strokes()
+        line.line(ticks.first!, v); line.line(ticks.last!, v)
+        ctx.addPath(line.path(top))
+        for u in ticks {
+            var tick = Strokes()
+            tick.line(u, v); tick.line(u, v + lift)
+            ctx.addPath(tick.path(top))
         }
-        for gap in 0..<3 {
-            var join = Strokes()
-            join.line(socketU[2 * gap + 1], v); join.line(socketU[2 * gap + 2], v)
-            ctx.addPath(join.path(top))
-            ctx.setStrokeColor(rgb(0.90, 0.20, 0.18))
-            ctx.strokePath()
-        }
+        ctx.setStrokeColor(rgb(0.92, 0.92, 0.93, 0.85))
+        ctx.setLineWidth(3)
+        ctx.strokePath()
+        ctx.addPath(top.quad(ticks[1] + 0.02, label - 0.008, ticks[3] - 0.02, label + 0.008))
+        ctx.setFillColor(rgb(0.90, 0.20, 0.18))
+        ctx.fillPath()
     }
 
     // "SL4", lying on the top face: S and L in white, 4 in red. The box is a little deeper than it is wide.
     let face = CGSize(width: 688, height: 640)
     let (v0, v1): (CGFloat, CGFloat) = (0.40, 0.60)
     let (ru, rv) = (26 / face.width, 26 / face.height)
-    ctx.addPath(letterS(0.17, v0, 0.38, v1, ru, rv).outline(top, width: 24, size: face))
-    ctx.addPath(letterL(0.44, v0, 0.62, v1).outline(top, width: 24, size: face))
+    ctx.addPath(letterS(0.17, v0, 0.38, v1, ru, rv).outline(top, width: 16, size: face))
+    ctx.addPath(letterL(0.44, v0, 0.62, v1).outline(top, width: 16, size: face))
     ctx.setFillColor(rgb(0.95, 0.95, 0.96))
     ctx.fillPath()
     ctx.setFillColor(rgb(0.90, 0.20, 0.18))
     for stroke in letter4(0.68, v0, 0.86, v1) {
-        ctx.addPath(stroke.outline(top, width: 24, size: face))
+        ctx.addPath(stroke.outline(top, width: 16, size: face))
         ctx.fillPath()
     }
 
-    // Along the front: eight gold RCA sockets (white and red inserts), the yellow and blue lights, the two USB
-    // sockets.
-    let socketY = (frontBottom + frontTop) / 2
-    for (i, x) in sockets.enumerated() {
+    // On the front, the inputs: ten gold RCA sockets in five stacked pairs, left (white) above right (red),
+    // grouped as decks 1-2, decks 3-4 and Aux.
+    let midY = (frontBottom + frontTop) / 2
+    func rca(_ x: CGFloat, _ y: CGFloat, white: Bool) {
         ctx.setFillColor(rgb(0.04, 0.04, 0.04))
-        ctx.fillEllipse(in: CGRect(x: x - 25, y: socketY - 25, width: 50, height: 50))
+        ctx.fillEllipse(in: CGRect(x: x - 25, y: y - 25, width: 50, height: 50))
         ctx.saveGState()
-        ctx.addEllipse(in: CGRect(x: x - 21, y: socketY - 21, width: 42, height: 42))
+        ctx.addEllipse(in: CGRect(x: x - 21, y: y - 21, width: 42, height: 42))
         ctx.clip()
         ctx.drawLinearGradient(gradient([rgb(1.0, 0.90, 0.62), rgb(0.78, 0.58, 0.24), rgb(0.55, 0.38, 0.13)]),
-                               start: CGPoint(x: x - 15, y: socketY + 21), end: CGPoint(x: x + 15, y: socketY - 21),
-                               options: [])
+                               start: CGPoint(x: x - 15, y: y + 21), end: CGPoint(x: x + 15, y: y - 21), options: [])
         ctx.restoreGState()
-        ctx.setFillColor(i % 2 == 0 ? rgb(0.93, 0.93, 0.92) : rgb(0.86, 0.18, 0.16))
-        ctx.fillEllipse(in: CGRect(x: x - 13, y: socketY - 13, width: 26, height: 26))
+        ctx.setFillColor(white ? rgb(0.93, 0.93, 0.92) : rgb(0.86, 0.18, 0.16))
+        ctx.fillEllipse(in: CGRect(x: x - 13, y: y - 13, width: 26, height: 26))
         ctx.setFillColor(rgb(0.05, 0.05, 0.05))
-        ctx.fillEllipse(in: CGRect(x: x - 5, y: socketY - 5, width: 10, height: 10))
+        ctx.fillEllipse(in: CGRect(x: x - 5, y: y - 5, width: 10, height: 10))
     }
-    for (x, colour, glow) in [(CGFloat(648), rgb(0.98, 0.80, 0.20), false), (690, rgb(0.35, 0.55, 1.0), true)] {
+    for x in columns {
+        rca(x, midY + 30, white: true)
+        rca(x, midY - 30, white: false)
+    }
+
+    // The four THRU lights, one above the other, lit green.
+    for i in 0..<4 {
+        let y = midY + 42 - CGFloat(i) * 28
         ctx.saveGState()
-        if glow { ctx.setShadow(offset: .zero, blur: 26, color: rgb(0.30, 0.50, 1.0, 1)) }
-        ctx.setFillColor(colour)
-        ctx.fillEllipse(in: CGRect(x: x - 11, y: socketY - 11, width: 22, height: 22))
+        ctx.setShadow(offset: .zero, blur: 14, color: rgb(0.25, 0.95, 0.40, 0.9))
+        ctx.setFillColor(rgb(0.30, 0.88, 0.42))
+        ctx.fillEllipse(in: CGRect(x: 528 - 9, y: y - 9, width: 18, height: 18))
         ctx.restoreGState()
     }
-    for x in [CGFloat(728), 790] {
-        let usb = CGRect(x: x, y: socketY - 14, width: 46, height: 28)
+
+    // The ground post (a knurled gold knob) over the blue DIP switch.
+    let post = CGPoint(x: 590, y: midY + 26)
+    ctx.setFillColor(rgb(0.04, 0.04, 0.04))
+    ctx.fillEllipse(in: CGRect(x: post.x - 30, y: post.y - 30, width: 60, height: 60))
+    ctx.saveGState()
+    ctx.addEllipse(in: CGRect(x: post.x - 27, y: post.y - 27, width: 54, height: 54))
+    ctx.clip()
+    ctx.drawLinearGradient(gradient([rgb(0.98, 0.88, 0.66), rgb(0.80, 0.64, 0.38), rgb(0.55, 0.42, 0.22)]),
+                           start: CGPoint(x: post.x - 20, y: post.y + 27), end: CGPoint(x: post.x + 20, y: post.y - 27),
+                           options: [])
+    ctx.restoreGState()
+    ctx.setStrokeColor(rgb(0.45, 0.33, 0.16, 0.8))
+    ctx.setLineWidth(2)
+    ctx.strokeEllipse(in: CGRect(x: post.x - 18, y: post.y - 18, width: 36, height: 36))
+    let dip = CGRect(x: post.x - 26, y: midY - 58, width: 52, height: 28)
+    ctx.addPath(CGPath(roundedRect: dip, cornerWidth: 3, cornerHeight: 3, transform: nil))
+    ctx.setFillColor(rgb(0.22, 0.52, 0.92))
+    ctx.fillPath()
+    for i in 0..<4 {
+        ctx.setFillColor(rgb(0.95, 0.96, 0.98))
+        ctx.fill(CGRect(x: dip.minX + 6 + CGFloat(i) * 11, y: dip.minY + 6, width: 7, height: 10))
+    }
+
+    // The two USB sockets, ports A and B: orange type-B sockets, each with a blue light to its left.
+    for x in [CGFloat(690), 790] {
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 16, color: rgb(0.30, 0.50, 1.0, 1))
+        ctx.setFillColor(rgb(0.35, 0.55, 1.0))
+        ctx.fillEllipse(in: CGRect(x: x - 34, y: midY - 30, width: 14, height: 14))
+        ctx.restoreGState()
+        let usb = CGRect(x: x - 8, y: midY - 30, width: 52, height: 48)
         ctx.addPath(CGPath(roundedRect: usb, cornerWidth: 4, cornerHeight: 4, transform: nil))
-        ctx.setFillColor(rgb(0.03, 0.03, 0.03))
+        ctx.setFillColor(rgb(0.93, 0.52, 0.18))
         ctx.fillPath()
-        ctx.addPath(CGPath(roundedRect: usb.insetBy(dx: 9, dy: 9), cornerWidth: 2, cornerHeight: 2, transform: nil))
-        ctx.setFillColor(rgb(0.55, 0.56, 0.58))
+        // The socket's opening: square, its top corners cut off, with the contact block inside.
+        let o = usb.insetBy(dx: 9, dy: 8)
+        let hole = CGMutablePath()
+        hole.addLines(between: [CGPoint(x: o.minX, y: o.minY), CGPoint(x: o.maxX, y: o.minY),
+                                CGPoint(x: o.maxX, y: o.maxY - 8), CGPoint(x: o.maxX - 8, y: o.maxY),
+                                CGPoint(x: o.minX + 8, y: o.maxY), CGPoint(x: o.minX, y: o.maxY - 8)])
+        hole.closeSubpath()
+        ctx.addPath(hole)
+        ctx.setFillColor(rgb(0.10, 0.07, 0.04))
         ctx.fillPath()
+        ctx.setFillColor(rgb(0.85, 0.48, 0.18))
+        ctx.fill(o.insetBy(dx: 9, dy: 8))
     }
 }
 
