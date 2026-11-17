@@ -16,7 +16,7 @@
 # Rane's own SL 4 driver: its kext, System Settings pane and settings daemon).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.3.0")
+DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.4.0")
 VERSION=${1:-$DEFAULT_VER}
 PKGSRC="$ROOT/Installer/package"
 OUT="$ROOT/build"

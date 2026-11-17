@@ -2,7 +2,7 @@
 
 All notable changes to the Rane SL4 macOS ARM Driver project are documented in this file.
 
-## [Unreleased]
+## [1.4.0] — 2026-11-17
 
 The SL 2 and SL 3 drivers' work (pepeleedj/Rane-SL2-Macos-ARM-Driver and Rane-SL3-Macos-ARM-Driver,
 v1.4.0) ported to the SL 4, with the SL 4's protocol worked out from Rane's SL4 driver 2.0.1f1 and

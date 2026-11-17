@@ -42,7 +42,7 @@
 #include <math.h>
 
 #ifndef SL4_VERSION
-#define SL4_VERSION  "1.3.0"
+#define SL4_VERSION  "1.4.0"
 #endif
 #define VID          0x1cc5
 #define PID          0x000f

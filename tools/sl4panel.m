@@ -20,7 +20,7 @@
 #include "SL4Status.h"   /* the driver's status packet ('sl4s') */
 
 #ifndef SL4_VERSION
-#define SL4_VERSION  "1.3.0"
+#define SL4_VERSION  "1.4.0"
 #endif
 #define kSL4PropStatus      'sl4s'
 #define kSL4PropInSafety    'sl4i'
